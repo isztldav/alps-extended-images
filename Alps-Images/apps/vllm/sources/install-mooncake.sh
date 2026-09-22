@@ -155,6 +155,21 @@ apt_get install -y --no-install-recommends \
     ca-certificates libibverbs-dev "${mooncake_apt_build_deps[@]}"
 rm -rf /var/lib/apt/lists/*
 
+# The NGC base images carry an NVIDIA/DOCA libibverbs-dev whose unversioned
+# libibverbs.so linker symlink is missing, so "-libverbs" fails to link (the
+# ROCm images use Ubuntu's package and are unaffected). Provide the symlink
+# for the build only; the installed modules reference the libibverbs.so.1
+# soname at runtime.
+created_ibverbs_link=""
+ibverbs_libdir="/usr/lib/$(gcc -print-multiarch)"
+if [[ ! -e "${ibverbs_libdir}/libibverbs.so" ]]; then
+    [[ -e "${ibverbs_libdir}/libibverbs.so.1" ]] \
+        || die "libibverbs.so.1 not found under ${ibverbs_libdir}"
+    ln -sf libibverbs.so.1 "${ibverbs_libdir}/libibverbs.so"
+    created_ibverbs_link="${ibverbs_libdir}/libibverbs.so"
+    echo "INFO: created missing linker symlink ${created_ibverbs_link}"
+fi
+
 rm -rf "${src_dir}"
 git clone --recursive "${MOONCAKE_REPO}" "${src_dir}"
 git -C "${src_dir}" checkout -q "${MOONCAKE_REF}"
@@ -162,6 +177,9 @@ git -C "${src_dir}" submodule update --init --recursive
 
 cmake -S "${src_dir}" -B "${build_dir}" "${cmake_args[@]}"
 cmake --build "${build_dir}" -j"${MOONCAKE_BUILD_JOBS}"
+if [[ -n "${created_ibverbs_link}" ]]; then
+    rm -f "${created_ibverbs_link}"
+fi
 
 # USE_CXI is cached as UNINITIALIZED (no option() declaration); the cxi
 # object files prove the flag actually took effect.
