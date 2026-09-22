@@ -281,8 +281,21 @@ cleanup_new_apt_build_deps /tmp/mooncake-apt-before.txt "${mooncake_apt_build_de
 ldconfig
 
 # Final verification against the post-cleanup image content.
-"${python_bin}" -c \
+# On CUDA, engine.so links libcuda.so.1, which only the NVIDIA container
+# runtime injects; the toolkit stubs ship it as libcuda.so only. Expose the
+# stub under its soname for this import alone, so it never lands in the image.
+import_ld_path="${LD_LIBRARY_PATH:-}"
+cuda_stub_soname_dir=""
+if [[ "${accel}" == "cuda" ]]; then
+    cuda_stub_soname_dir="$(mktemp -d)"
+    ln -s "${cuda_stubs}/libcuda.so" "${cuda_stub_soname_dir}/libcuda.so.1"
+    import_ld_path="${cuda_stub_soname_dir}${import_ld_path:+:${import_ld_path}}"
+fi
+LD_LIBRARY_PATH="${import_ld_path}" "${python_bin}" -c \
     'from mooncake.engine import TransferEngine; from mooncake.store import MooncakeDistributedStore; print("mooncake imports ok")'
+if [[ -n "${cuda_stub_soname_dir}" ]]; then
+    rm -rf "${cuda_stub_soname_dir}"
+fi
 
 all_missing=""
 for elf_file in "${mooncake_elf_files[@]}"; do
