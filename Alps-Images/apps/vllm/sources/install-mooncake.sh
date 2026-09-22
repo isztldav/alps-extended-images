@@ -96,6 +96,9 @@ done
 [[ -n "${libfabric_lib}" ]] \
     || die "libfabric library not found under ${LIBFABRIC_PREFIX}"
 
+[[ -f /usr/local/include/boost/version.hpp ]] \
+    || die "Boost headers not found under /usr/local/include; expected from the Alps base image"
+
 echo "INFO: building Mooncake ${MOONCAKE_REF} (${accel}) against ${libfabric_lib}"
 
 cmake_args=(
@@ -149,16 +152,9 @@ case "${accel}" in
         ;;
 esac
 
-# Build dependencies are removed again after the wheel is installed. Runtime
-# libraries that the installed Mooncake modules link against are marked
-# manually installed so they survive cleanup_new_apt_build_deps' autoremove.
-# libibverbs-dev stays installed: the base images keep verbs headers around
-# (see APT_CLEANUP_HOLD_PACKAGES in package-helpers.sh) and Mooncake's RDMA
-# transport links against libibverbs.
 mooncake_apt_build_deps=(
     cmake
     git
-    libboost-dev
     libcurl4-openssl-dev
     libgflags-dev
     libgoogle-glog-dev
