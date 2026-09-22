@@ -19,15 +19,17 @@
 # Environment overrides:
 #   MOONCAKE_REPO        git remote (default: upstream GitHub)
 #   MOONCAKE_REF         pinned tag or commit (default: v0.3.13.post1; the
-#                        CXI backend ships since v0.3.12)
+#                        CXI backend ships since v0.3.12). Fetched shallowly;
+#                        a full fetch is the fallback for remotes that refuse
+#                        fetching a bare commit.
 #   LIBFABRIC_PREFIX     Alps libfabric prefix (default: /usr)
-#   MOONCAKE_BUILD_JOBS  parallel build jobs (default: 32)
+#   MOONCAKE_BUILD_JOBS  parallel build jobs (default: MAX_JOBS, else 32)
 set -euo pipefail
 
 MOONCAKE_REPO="${MOONCAKE_REPO:-https://github.com/kvcache-ai/Mooncake.git}"
 MOONCAKE_REF="${MOONCAKE_REF:-v0.3.13.post1}"
 LIBFABRIC_PREFIX="${LIBFABRIC_PREFIX:-/usr}"
-MOONCAKE_BUILD_JOBS="${MOONCAKE_BUILD_JOBS:-32}"
+MOONCAKE_BUILD_JOBS="${MOONCAKE_BUILD_JOBS:-${MAX_JOBS:-32}}"
 ALPS_PACKAGE_HELPERS="${ALPS_PACKAGE_HELPERS:-/opt/alps/package-helpers.sh}"
 
 accel="${1:-}"
@@ -42,6 +44,30 @@ source "${ALPS_PACKAGE_HELPERS}"
 die() {
     echo "ERROR: $*" >&2
     exit 1
+}
+
+# Temporary build-only filesystem changes, undone on every exit path so a
+# failed step cannot leave them behind.
+created_ibverbs_link=""
+cuda_stub_soname_dir=""
+cleanup_build_temporaries() {
+    if [[ -n "${created_ibverbs_link}" ]]; then
+        rm -f "${created_ibverbs_link}"
+    fi
+    if [[ -n "${cuda_stub_soname_dir}" ]]; then
+        rm -rf "${cuda_stub_soname_dir}"
+    fi
+}
+trap cleanup_build_temporaries EXIT
+
+# Copy the one file a build-tree glob must match (e.g. engine.<EXT_SUFFIX>).
+copy_single_match() {
+    local dest="$1"
+    shift
+    if [[ $# -ne 1 || ! -f "$1" ]]; then
+        die "expected exactly one build artifact for ${dest##*/}, got: $*"
+    fi
+    cp "$1" "${dest}"
 }
 
 python_bin="$(command -v python || command -v python3)"
@@ -160,7 +186,6 @@ rm -rf /var/lib/apt/lists/*
 # ROCm images use Ubuntu's package and are unaffected). Provide the symlink
 # for the build only; the installed modules reference the libibverbs.so.1
 # soname at runtime.
-created_ibverbs_link=""
 ibverbs_libdir="/usr/lib/$(gcc -print-multiarch)"
 if [[ ! -e "${ibverbs_libdir}/libibverbs.so" ]]; then
     [[ -e "${ibverbs_libdir}/libibverbs.so.1" ]] \
@@ -171,14 +196,22 @@ if [[ ! -e "${ibverbs_libdir}/libibverbs.so" ]]; then
 fi
 
 rm -rf "${src_dir}"
-git clone --recursive "${MOONCAKE_REPO}" "${src_dir}"
-git -C "${src_dir}" checkout -q "${MOONCAKE_REF}"
+git init -q "${src_dir}"
+git -C "${src_dir}" remote add origin "${MOONCAKE_REPO}"
+if git -C "${src_dir}" fetch -q --depth 1 origin "${MOONCAKE_REF}"; then
+    git -C "${src_dir}" checkout -q FETCH_HEAD
+else
+    echo "INFO: shallow fetch of ${MOONCAKE_REF} failed; fetching full history"
+    git -C "${src_dir}" fetch -q --tags origin
+    git -C "${src_dir}" checkout -q "${MOONCAKE_REF}"
+fi
 git -C "${src_dir}" submodule update --init --recursive
 
 cmake -S "${src_dir}" -B "${build_dir}" "${cmake_args[@]}"
 cmake --build "${build_dir}" -j"${MOONCAKE_BUILD_JOBS}"
 if [[ -n "${created_ibverbs_link}" ]]; then
     rm -f "${created_ibverbs_link}"
+    created_ibverbs_link=""
 fi
 
 # USE_CXI is cached as UNINITIALIZED (no option() declaration); the cxi
@@ -198,8 +231,8 @@ echo "INFO: cxi_transport built (${cxi_object_count} objects)"
 # Stage the artifacts that upstream's scripts/build_wheel.sh ships in its
 # wheels. Mooncake links statically by default, so engine.so and store.so are
 # self-contained apart from system libraries and libasio.so.
-cp "${build_dir}"/mooncake-integration/engine.*.so "${wheel_pkg_dir}/engine.so"
-cp "${build_dir}"/mooncake-integration/store.*.so "${wheel_pkg_dir}/store.so"
+copy_single_match "${wheel_pkg_dir}/engine.so" "${build_dir}"/mooncake-integration/engine.*.so
+copy_single_match "${wheel_pkg_dir}/store.so" "${build_dir}"/mooncake-integration/store.*.so
 cp "${build_dir}/mooncake-common/libasio.so" "${wheel_pkg_dir}/libasio.so"
 cp "${src_dir}/mooncake-integration/fabric_allocator_utils.py" \
     "${wheel_pkg_dir}/fabric_allocator_utils.py"
@@ -285,7 +318,6 @@ ldconfig
 # runtime injects; the toolkit stubs ship it as libcuda.so only. Expose the
 # stub under its soname for this import alone, so it never lands in the image.
 import_ld_path="${LD_LIBRARY_PATH:-}"
-cuda_stub_soname_dir=""
 if [[ "${accel}" == "cuda" ]]; then
     cuda_stub_soname_dir="$(mktemp -d)"
     ln -s "${cuda_stubs}/libcuda.so" "${cuda_stub_soname_dir}/libcuda.so.1"
@@ -295,6 +327,7 @@ LD_LIBRARY_PATH="${import_ld_path}" "${python_bin}" -c \
     'from mooncake.engine import TransferEngine; from mooncake.store import MooncakeDistributedStore; print("mooncake imports ok")'
 if [[ -n "${cuda_stub_soname_dir}" ]]; then
     rm -rf "${cuda_stub_soname_dir}"
+    cuda_stub_soname_dir=""
 fi
 
 all_missing=""

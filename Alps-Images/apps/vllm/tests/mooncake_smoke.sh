@@ -22,13 +22,24 @@ except ImportError:
     torch = None
 
 
+# The IP only carries Mooncake's TCP handshake/metadata RPC for this
+# self-transfer; the data path is CXI, addressed by libfabric. Prefer the
+# node's own hostname address, and fall back to the source address of the
+# default route (a UDP connect() only does a route lookup and sends nothing,
+# so it needs no outbound connectivity).
 def get_ip():
     try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if not ip.startswith("127."):
+            return ip
+    except OSError:
+        pass
+    try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
+            s.connect(("192.0.2.1", 9))  # TEST-NET-1, never contacted
             return s.getsockname()[0]
     except OSError:
-        return socket.gethostbyname(socket.gethostname())
+        return "127.0.0.1"
 
 
 # Import torch before mooncake, matching vLLM. On rocm the reverse order maps
